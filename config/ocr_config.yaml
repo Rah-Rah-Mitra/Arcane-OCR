@@ -1,0 +1,6 @@
+models:
+  det_hef: ./models/hailo8l/ocr_det.hef
+  rec_hef: ./models/hailo8l/ocr.hef
+runtime:
+  use_corrector: true
+  dictionary_path: ./public/samples/frequency_dictionary_en_82_765.txt

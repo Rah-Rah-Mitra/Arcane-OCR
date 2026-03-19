@@ -1,0 +1,8 @@
+numpy<2
+opencv-python<=4.10.0.84
+shapely
+pyclipper
+symspellpy
+pypdfium2
+Pillow
+PyYAML
