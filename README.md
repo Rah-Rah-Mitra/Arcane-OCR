@@ -1,5 +1,7 @@
 # Arcane OCR (Standalone)
 
+[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Supported-C51A4A?logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/) [![Hailo-8L](https://img.shields.io/badge/Hailo-8L%20NPU-0B6E4F)](https://hailo.ai/) [![Python](https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/) [![OpenCV](https://img.shields.io/badge/OpenCV-4.x-5C3EE8?logo=opencv&logoColor=white)](https://opencv.org/) [![pypdfium2](https://img.shields.io/badge/PDFium-pypdfium2-00599C)](https://pypi.org/project/pypdfium2/) [![SymSpell](https://img.shields.io/badge/SymSpell-Spell%20Correction-EE7F2D)](https://github.com/wolfgarbe/SymSpell)
+
 Standalone OCR-only project for Raspberry Pi + Hailo-8L.
 
 This project contains only the OCR pipeline components (image + PDF) and excludes unrelated example apps.
