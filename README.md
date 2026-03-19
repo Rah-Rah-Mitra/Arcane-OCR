@@ -83,6 +83,86 @@ For dense CV/table-of-contents pages, run sliding-window OCR with overlap:
 
 Default overlap is 12% and can be tuned in the 10-15% range.
 
+### 8) Faster Runtime (Balanced)
+
+Use adaptive tiling and recognizer batching to reduce scheduler overhead:
+
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_balanced_run \
+  --tile-size 1024 \
+  --tile-overlap-ratio 0.12 \
+  --max-tiles-per-page 9 \
+  --rec-batch-size 8
+```
+
+On a single-page sample in this repo, this reduced runtime to about 1.9s with 4 tiles.
+
+### 9) A4-Optimized OCR (Recommended for PDFs)
+
+Use A4-aware rendering at standard DPI with detector-native tiling (544×960) to eliminate resolution loss:
+
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_a4native_run \
+  --a4-mode \
+  --pdf-dpi 200 \
+  --tile-overlap-ratio 0.12 \
+  --rec-batch-size 8
+```
+
+Key benefits:
+
+- **A4 pages rendered at 200 DPI** (1653×2339px) - standard for document OCR
+- **6 tiles per page** using detector native 544×960 dimensions
+- **Zero shrinking loss** - tiles go directly to model without downsampling
+- **17.7s for 7 pages** (874 text regions detected)
+- Quality parity with dense tiling at 2.6× speed improvement
+
+DPI options:
+
+- 150 DPI: faster, lower resolution (1240×1754px)
+- 200 DPI: balanced (1653×2339px) - recommended
+- 250 DPI: higher resolution (1653×2339px)
+- 300 DPI: maximum detail (2480×3508px)
+
+## Speed/Accuracy Profiles
+
+Use these presets as a starting point:
+
+- Fast (lowest latency):
+
+```bash
+./scripts/run_ocr.sh --input ./public/samples/contents_page_sample.pdf --output-dir ./output/pdf_fast_run --pdf-scale 2.0 --tile-size 1280 --tile-overlap-ratio 0.08 --max-tiles-per-page 6 --rec-batch-size 12 --nms-iou-threshold 0.5
+```
+
+- Balanced (recommended default):
+
+```bash
+./scripts/run_ocr.sh --input ./public/samples/contents_page_sample.pdf --output-dir ./output/pdf_balanced_run --pdf-scale 2.5 --tile-size 1024 --tile-overlap-ratio 0.12 --max-tiles-per-page 9 --rec-batch-size 8 --nms-iou-threshold 0.5
+```
+
+- A4-Optimized (best for PDF documents):
+
+```bash
+./scripts/run_ocr.sh --input ./public/samples/contents_page_sample.pdf --output-dir ./output/pdf_a4native_run --a4-mode --pdf-dpi 200 --tile-overlap-ratio 0.12 --rec-batch-size 8
+```
+
+- Max accuracy (dense docs):
+
+```bash
+./scripts/run_ocr.sh --input ./public/samples/contents_page_sample.pdf --output-dir ./output/pdf_maxacc_run --pdf-scale 3.0 --tile-size 960 --tile-overlap-ratio 0.15 --max-tiles-per-page 0 --rec-batch-size 4 --nms-iou-threshold 0.45
+```
+
+Notes:
+
+- `--a4-mode` automatically selects 544×960 detector-native tiling and DPI-based scaling
+- `--max-tiles-per-page` adaptively increases tile size to avoid over-tiling on large pages
+- `--rec-batch-size` batches recognition crops per call, which is usually the largest speed gain
+- `--rec-priority` and `--det-priority` can be tuned if one stage starves the other
+
 ## Live Verification (NPU Activity)
 
 Use this to verify models are running on the Hailo NPU in real time.

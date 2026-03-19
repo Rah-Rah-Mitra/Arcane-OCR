@@ -19,11 +19,17 @@ class HailoInfer:
         input_type: Optional[str] = None,
         output_type: Optional[str] = None,
         priority: int = 0,
+        vdevice: Optional[VDevice] = None,
+        scheduler_algorithm: HailoSchedulingAlgorithm = HailoSchedulingAlgorithm.ROUND_ROBIN,
+        group_id: str = "SHARED",
     ) -> None:
-        params = VDevice.create_params()
-        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
-        params.group_id = "SHARED"
-        self.target = VDevice(params)
+        if vdevice is None:
+            params = VDevice.create_params()
+            params.scheduling_algorithm = scheduler_algorithm
+            params.group_id = group_id
+            self.target = VDevice(params)
+        else:
+            self.target = vdevice
 
         hef_path = os.fspath(hef_path)
         self.hef = HEF(hef_path)
@@ -105,3 +111,13 @@ class HailoInfer:
             self.last_infer_job.wait(10000)
         if self.config_ctx:
             self.config_ctx.__exit__(None, None, None)
+
+
+def create_shared_vdevice(
+    scheduler_algorithm: HailoSchedulingAlgorithm = HailoSchedulingAlgorithm.ROUND_ROBIN,
+    group_id: str = "SHARED",
+) -> VDevice:
+    params = VDevice.create_params()
+    params.scheduling_algorithm = scheduler_algorithm
+    params.group_id = group_id
+    return VDevice(params)
