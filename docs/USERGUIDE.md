@@ -50,6 +50,19 @@ All commands go through the `run_ocr.sh` wrapper, which activates the virtual en
   --max-pages 3
 ```
 
+### Combine multi-page outputs into a single document
+
+For PDFs with multiple pages (like tables of contents), automatically combine per-page structured outputs into unified JSON and Markdown:
+
+```bash
+./scripts/run_ocr.sh \
+  --input document.pdf \
+  --output-dir ./output/combined_run \
+  --combine-pages
+```
+
+This generates `combined_contents.json` and `combined_contents.md` alongside individual page files.
+
 ## Recommended Profiles
 
 ### A4-Optimized (best for PDF documents)
@@ -114,6 +127,91 @@ For tables of contents, dense tables, or fine print. More tiles, tighter overlap
   --max-tiles-per-page 0 \
   --rec-batch-size 4 \
   --nms-iou-threshold 0.45
+```
+
+## Page Combining
+
+For multi-page documents (especially tables of contents), Arcane OCR can automatically combine per-page OCR results into a unified document with preserved hierarchy. This solves challenges like reconstructing document structure across page breaks, filtering repeated headers, and maintaining logical nesting.
+
+### During pipeline execution
+
+Add `--combine-pages` to automatically generate combined output:
+
+```bash
+./scripts/run_ocr.sh \
+  --input table_of_contents.pdf \
+  --output-dir ./output/toc_run \
+  --max-accuracy \
+  --combine-pages
+```
+
+This produces:
+- `combined_contents.json` — full tree structure with cross-page hierarchy
+- `combined_contents.md` — markdown with nested bullet points and page references
+- Plus all individual per-page files
+
+### Standalone on existing outputs
+
+Process previously generated OCR output files without re-running inference:
+
+```bash
+python3 -m src.arcane_ocr.combine_pages \
+  ./output/maxacc_run \
+  --pattern "contents_page_*_structured.json"
+```
+
+Options:
+- `--pattern` — glob pattern for JSON files to combine (default: `*_structured.json`)
+- `--output-name` — base name for output files (default: `combined_contents`)
+
+### How it works
+
+The page combiner reconstructs document structure by:
+
+1. **Filtering** — removes repeated page headers ("contents vii", "vi introduction")
+2. **Parsing hierarchy** — uses indent levels (spatial position) as primary nesting signal
+3. **Extracting structure** — detects section numbers ("2 1" → "2.1") and page references
+4. **Recognizing parts** — identifies roman numeral part headers ("ii geometry of two views")
+5. **Maintaining context** — builds a tree across page boundaries using a stack-based builder
+6. **Generating output** — produces both tree structure (JSON) and readable markdown
+
+**Example input (per-page structured JSON):**
+
+```json
+{
+  "lines": [
+    {"text": "Chapter 1", "indent_level": 0},
+    {"text": "1 1 Introduction", "indent_level": 1},
+    {"text": "1 2 Background", "indent_level": 1}
+  ]
+}
+```
+
+**Combined JSON output:**
+
+```json
+{
+  "children": [
+    {
+      "text": "Chapter 1",
+      "section_number": "",
+      "children": [
+        {"text": "Introduction", "section_number": "1.1", "page_number": 15},
+        {"text": "Background", "section_number": "1.2", "page_number": 17}
+      ]
+    }
+  ]
+}
+```
+
+**Combined Markdown output:**
+
+```markdown
+# Combined Contents
+
+- Chapter 1
+  - **1.1** Introduction ... 15
+  - **1.2** Background ... 17
 ```
 
 ## CLI Reference
@@ -181,6 +279,13 @@ For tables of contents, dense tables, or fine print. More tiles, tighter overlap
 |------|---------|-------------|
 | `--use-corrector` | from config | Enable SymSpell text correction |
 | `--disable-corrector` | off | Disable text correction |
+
+### Page Combining
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--combine-pages` | off | Combine all per-page structured outputs into a single document with unified hierarchy |
+| `--combined-name` | `combined_contents` | Base filename for combined output (generates `.json` and `.md` variants) |
 
 ## Output Files
 
@@ -262,6 +367,74 @@ Generated once per run in the output directory:
   ]
 }
 ```
+
+### Combined Output Files (`combined_contents.json` and `combined_contents.md`)
+
+When `--combine-pages` is enabled and multiple pages are processed, per-page structures are merged into unified JSON and Markdown files. This is valuable for multi-page documents like tables of contents where hierarchy must be reconstructed across page boundaries.
+
+**Combined JSON** (`combined_contents.json`):
+
+```json
+{
+  "children": [
+    {
+      "text": "Preface",
+      "section_number": "",
+      "children": [
+        {
+          "text": "Overview vii",
+          "section_number": "",
+          "page_number": 7,
+          "page_number_roman": null,
+          "source_page": "contents_page_01"
+        }
+      ],
+      "source_page": "contents_page_01"
+    },
+    {
+      "text": "Chapter 1: Introduction",
+      "section_number": "1",
+      "page_number": 1,
+      "children": [...]
+    }
+  ],
+  "entries_flat": [
+    {
+      "text": "Preface",
+      "section_number": "",
+      "indent_level": 0,
+      "page_number": 7,
+      "source_page": "contents_page_01"
+    },
+    ...
+  ]
+}
+```
+
+**Combined Markdown** (`combined_contents.md`):
+
+```markdown
+# Combined Contents
+
+- Preface ... vii
+  - Overview vii
+- **1** Introduction ... 1
+  - **1.1** Background ... 3
+  - **1.2** Motivation ... 5
+- **2** Methodology ... 15
+  - Part II
+    - **2.1** Framework ... 21
+```
+
+**Features of the combiner:**
+
+- **Page header filtering** — strips repeated headers like "contents xv", "xviii contents"
+- **Indent-based hierarchy** — uses spatial `indent_level` from per-page analysis as primary depth signal
+- **Section number parsing** — detects patterns like "2 1" and formats as "2.1"
+- **Page number extraction** — recognizes both arabic ("...Page 131") and roman ("...vii") trailing references
+- **Part-level headers** — recognizes roman numeral part prefixes ("ii geometry of two views")
+- **Cross-page continuation** — uses stack-based tree builder to maintain hierarchy context across boundaries
+- **Flat entries array** — provides `entries_flat` for direct access without tree navigation, including page tracking
 
 ## PDF DPI Selection
 

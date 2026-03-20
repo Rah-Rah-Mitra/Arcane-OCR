@@ -88,6 +88,19 @@ PaddlePaddle DB (Differentiable Binarization) postprocessor:
 - `DBPostProcess` — binarize heatmap, find contours, unclip polygons via Vatti clipping (pyclipper), filter by score/area
 - Uses `shapely` for polygon area and `pyclipper` for polygon expansion
 
+### `src/arcane_ocr/combine_pages.py`
+
+Multi-page hierarchy reconstruction:
+
+- `combine_page_structures()` — merges per-page structured outputs across page boundaries using stack-based tree building
+- `_build_hierarchy_from_lines()` — orchestrates page combining logic with header filtering
+- `_parse_section_number()` — extracts leading numeric tokens for display formatting
+- `_extract_trailing_page_num()` — detects both arabic and roman numeral page references
+- `_is_page_header()` — filters repeated page headers using regex patterns
+- `write_combined_outputs()` — generates both JSON (tree + flat array) and Markdown outputs
+
+Key features: indent-level-based nesting, cross-page continuation via stack, section number parsing, part prefix detection, and page number extraction (arabic and roman).
+
 ## Inference Flow
 
 ```

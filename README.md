@@ -166,6 +166,7 @@ flowchart TD
 - **Multi-threaded tile inference** (opt-in) overlapping Python preprocessing with NPU inference
 - **A4-optimized PDF mode** with DPI-based rendering and detector-native tiling
 - **Structured output** with JSON (line groups, indent levels, bounding boxes) and Markdown hierarchy
+- **Page combining** (opt-in) reconstructs document hierarchy across page boundaries with smart header filtering and section number detection
 - **SymSpell text correction** with custom frequency dictionary support for post-OCR spelling fixes
 - **Timing reports** with per-page and total runtime metrics
 
@@ -195,6 +196,7 @@ arcane-ocr/
 └── docs/
     ├── DEVELOPER.md          # Architecture and development guide
     ├── USERGUIDE.md          # Usage instructions and profiles
+    ├── PAGE_COMBINING.md     # Multi-page hierarchy reconstruction
     ├── PIPELINE_SETUP.md     # Full setup walkthrough
     └── OPTIMIZATION_GUIDE.md # Tiling strategies and tuning
 ```

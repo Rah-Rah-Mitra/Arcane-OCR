@@ -16,6 +16,7 @@ import yaml
 from degirum_tools import generate_tiles_fixed_size
 
 from .hailo_inference import HailoInfer, create_shared_vdevice
+from .combine_pages import combine_page_structures, write_combined_outputs
 from .ocr_utils import (
     OcrCorrector,
     default_preprocess,
@@ -93,6 +94,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of parallel tile inference threads (1=sequential, 2-3 for overlap)",
+    )
+    parser.add_argument(
+        "--combine-pages",
+        action="store_true",
+        help="Combine all per-page structured outputs into a single document with hierarchy",
+    )
+    parser.add_argument(
+        "--combined-name",
+        type=str,
+        default="combined_contents",
+        help="Base filename for combined output (default: combined_contents)",
     )
     return parser.parse_args()
 
@@ -844,6 +856,7 @@ def main() -> int:
     tile_workers = max(1, int(args.tile_workers))
 
     summary = []
+    page_structures_for_combine: List[Tuple[str, Dict]] = []
     start_total = time.perf_counter()
 
     try:
@@ -949,6 +962,9 @@ def main() -> int:
             page_structure = build_page_structure(dedup_entries, page_w=page_w, page_h=page_h)
             structured_json, structured_md = write_structured_outputs(item_name, page_structure, output_dir)
 
+            if args.combine_pages:
+                page_structures_for_combine.append((item_name, page_structure))
+
             elapsed = time.perf_counter() - start_item
             print(
                 f"[TIME] {item_name}: {elapsed:.3f}s "
@@ -993,6 +1009,19 @@ def main() -> int:
 
     print(f"[TIME] Total OCR runtime: {total_elapsed:.3f}s")
     print(f"[INFO] Timing report: {report_path}")
+
+    # --- Combine pages ---
+    if args.combine_pages and len(page_structures_for_combine) > 1:
+        page_names = [name for name, _ in page_structures_for_combine]
+        structures = [struct for _, struct in page_structures_for_combine]
+        combined = combine_page_structures(structures, page_names)
+        combined_json, combined_md = write_combined_outputs(
+            combined, output_dir, args.combined_name,
+        )
+        print(f"[INFO] Combined output ({len(page_names)} pages):")
+        print(f"  JSON: {combined_json}")
+        print(f"  Markdown: {combined_md}")
+
     return 0
 
 
