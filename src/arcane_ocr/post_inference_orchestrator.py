@@ -112,6 +112,7 @@ class OCRPostProcessor:
         self,
         strip_detections: Sequence[Sequence[Dict[str, Any]]],
         tile_height: int,
+        strip_y_offsets: Sequence[int] | None = None,
     ) -> List[Dict[str, Any]]:
         """Merge local strip detections into global coordinates.
 
@@ -122,7 +123,13 @@ class OCRPostProcessor:
             "text": "optional"
         }
         """
-        offsets = self._infer_tile_offsets(len(strip_detections), tile_height)
+        if strip_y_offsets is None:
+            offsets = self._infer_tile_offsets(len(strip_detections), tile_height)
+        else:
+            if len(strip_y_offsets) != len(strip_detections):
+                raise ValueError("strip_y_offsets must match strip_detections length")
+            offsets = np.asarray(strip_y_offsets, dtype=np.int32)
+
         merged: List[Dict[str, Any]] = []
 
         for strip_idx, strip in enumerate(strip_detections):
@@ -316,8 +323,13 @@ class OCRPostProcessor:
         strip_detections: Sequence[Sequence[Dict[str, Any]]],
         tile_height: int,
         page_width: int,
+        strip_y_offsets: Sequence[int] | None = None,
     ) -> Dict[str, Any]:
-        global_dets = self.collect_global_detections(strip_detections, tile_height)
+        global_dets = self.collect_global_detections(
+            strip_detections,
+            tile_height,
+            strip_y_offsets=strip_y_offsets,
+        )
         deduped = self.deduplicate(global_dets)
         structured = self.build_structure(deduped, page_width)
         structured["global_detections"] = deduped
