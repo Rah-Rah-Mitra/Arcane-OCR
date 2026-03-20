@@ -35,6 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="./output", help="Directory to save outputs")
     parser.add_argument("--use-corrector", action="store_true", help="Enable OCR text correction")
     parser.add_argument("--disable-corrector", action="store_true", help="Disable OCR text correction")
+    parser.add_argument("--dictionary-path", default=None, help="Path to custom SymSpell frequency dictionary (overrides config)")
     parser.add_argument("--pdf-scale", type=float, default=2.0, help="PDF render scale")
     parser.add_argument("--tile-size", type=int, default=1024, help="Sliding-window tile size in pixels")
     parser.add_argument(
@@ -790,7 +791,10 @@ def main() -> int:
     if args.disable_corrector:
         use_corrector = False
 
-    dictionary_path = Path(config.get("runtime", {}).get("dictionary_path", "./public/samples/frequency_dictionary_en_82_765.txt")).expanduser().resolve()
+    dictionary_path = Path(
+        args.dictionary_path
+        or config.get("runtime", {}).get("dictionary_path", "./public/samples/frequency_dictionary_en_82_765.txt")
+    ).expanduser().resolve()
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -928,10 +932,17 @@ def main() -> int:
 
             # --- NMS ---
             dedup_entries = nms_entries(all_entries, iou_threshold=float(args.nms_iou_threshold))
+
+            # --- SymSpell correction ---
+            if ocr_corrector:
+                for entry in dedup_entries:
+                    entry["text_raw"] = entry["text"]
+                    entry["text"] = ocr_corrector.correct_text(entry["text"])
+
             boxes = [entry["bbox"] for entry in dedup_entries]
             texts = [entry["text"] for entry in dedup_entries]
 
-            annotated = visualize_ocr_annotations(original, boxes, texts, ocr_corrector)
+            annotated = visualize_ocr_annotations(original, boxes, texts, None)
             out_path = output_dir / f"{item_name}_ocr.png"
             cv2.imwrite(str(out_path), annotated)
 
