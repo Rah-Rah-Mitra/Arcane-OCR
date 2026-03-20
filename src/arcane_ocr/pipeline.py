@@ -18,10 +18,12 @@ from .ocr_utils import (
     OcrCorrector,
     default_preprocess,
     det_postprocess,
+    load_ocr_character_dictionary,
     ocr_eval_postprocess,
     resize_with_padding,
     visualize_ocr_annotations,
 )
+from .post_inference_orchestrator import OCRPostProcessor
 
 
 def parse_args() -> argparse.Namespace:
@@ -64,6 +66,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rec-priority", type=int, default=1, help="Scheduler priority for recognizer model")
     parser.add_argument("--group-id", default="SHARED", help="Hailo vdevice group id")
     parser.add_argument("--max-pages", type=int, default=0, help="Limit PDF pages (0 means all pages)")
+    parser.add_argument(
+        "--postprocess-mode",
+        choices=["orchestrator", "legacy"],
+        default="orchestrator",
+        help="Postprocessing path: orchestrator (default) or legacy",
+    )
+    parser.add_argument(
+        "--legacy-postprocess",
+        action="store_true",
+        help="Shortcut to force legacy postprocessing path",
+    )
+    parser.add_argument(
+        "--orchestrator-overlap-ratio",
+        type=float,
+        default=0.25,
+        help="Vertical strip overlap ratio for orchestrator mode",
+    )
+    parser.add_argument(
+        "--orchestrator-iou-threshold",
+        type=float,
+        default=0.4,
+        help="IoU threshold used by orchestrator NMS",
+    )
+    parser.add_argument(
+        "--line-center-threshold-ratio",
+        type=float,
+        default=0.5,
+        help="Line grouping threshold ratio against average text height",
+    )
+    parser.add_argument(
+        "--right-column-ratio",
+        type=float,
+        default=0.72,
+        help="X split ratio for title/page-number separation",
+    )
     return parser.parse_args()
 
 
@@ -200,6 +237,31 @@ def generate_sliding_windows(
     return windows
 
 
+def generate_vertical_strips(
+    image_h: int,
+    image_w: int,
+    tile_height: int,
+    overlap_ratio: float,
+) -> List[Tuple[int, int, int, int]]:
+    overlap_ratio = max(0.0, min(overlap_ratio, 0.95))
+    tile_height = max(1, int(tile_height))
+    stride = max(1, int(tile_height * (1.0 - overlap_ratio)))
+
+    if image_h <= tile_height:
+        ys = [0]
+    else:
+        ys = list(range(0, image_h - tile_height + 1, stride))
+        if ys[-1] != image_h - tile_height:
+            ys.append(image_h - tile_height)
+
+    windows: List[Tuple[int, int, int, int]] = []
+    for y in ys:
+        y2 = min(image_h, y + tile_height)
+        windows.append((0, y, image_w, y2))
+
+    return windows
+
+
 def adapt_tile_size_for_budget(
     image_h: int,
     image_w: int,
@@ -278,6 +340,8 @@ def infer_tile_entries(
     tile_index: int,
     rec_batch_size: int,
     min_box_area: int,
+    rec_character_dict: List[str] | None,
+    output_local_boxes: bool = False,
 ) -> List[Dict]:
     det_input = default_preprocess(tile_image, det_w, det_h)
     det_out = run_single_inference(det_infer, det_input)
@@ -309,18 +373,21 @@ def infer_tile_entries(
         batch_out = run_batch_inference(rec_infer, batch_inputs)
 
         for rec_out, (crop_idx, local_box) in zip(batch_out[:actual_count], batch_meta[:actual_count]):
-            text, conf = ocr_eval_postprocess(rec_out)[0]
+            text, conf = ocr_eval_postprocess(rec_out, character_dict=rec_character_dict)[0]
             text = text.strip()
             if not text:
                 continue
 
             x, y, w, h = local_box
-            global_bbox = [tile_origin_x + x, tile_origin_y + y, w, h]
+            if output_local_boxes:
+                bbox = [x, y, w, h]
+            else:
+                bbox = [tile_origin_x + x, tile_origin_y + y, w, h]
             tile_entries.append(
                 {
                     "tile_index": tile_index,
                     "crop_index": crop_idx,
-                    "bbox": global_bbox,
+                    "bbox": bbox,
                     "text": text,
                     "score": float(conf),
                 }
@@ -401,11 +468,15 @@ def write_structured_outputs(page_name: str, page_structure: Dict, output_dir: P
         json.dump(page_structure, f, indent=2, ensure_ascii=False)
 
     md_lines = [f"# OCR Structure: {page_name}", ""]
-    for line in page_structure.get("lines", []):
-        indent = "  " * int(line.get("indent_level", 0))
-        text = line.get("text", "").strip()
-        if text:
-            md_lines.append(f"{indent}- {text}")
+    markdown_body = str(page_structure.get("markdown", "")).strip()
+    if markdown_body:
+        md_lines.append(markdown_body)
+    else:
+        for line in page_structure.get("lines", []):
+            indent = "  " * int(line.get("indent_level", 0))
+            text = line.get("text", "").strip()
+            if text:
+                md_lines.append(f"{indent}- {text}")
 
     with md_path.open("w", encoding="utf-8") as f:
         f.write("\n".join(md_lines) + "\n")
@@ -428,6 +499,7 @@ def main() -> int:
         use_corrector = False
 
     dictionary_path = Path(config.get("runtime", {}).get("dictionary_path", "./public/samples/frequency_dictionary_en_82_765.txt")).expanduser().resolve()
+    rec_dictionary_path = Path(config.get("runtime", {}).get("rec_dictionary_path", "./public/samples/ppocrv5_dict.txt")).expanduser().resolve()
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -447,6 +519,9 @@ def main() -> int:
     )
 
     ocr_corrector = OcrCorrector(str(dictionary_path)) if use_corrector else None
+    rec_character_dict: List[str] | None = None
+    if rec_dictionary_path.exists():
+        rec_character_dict = load_ocr_character_dictionary(str(rec_dictionary_path))
 
     shared_vdevice = create_shared_vdevice(group_id=args.group_id)
     det_infer = HailoInfer(
@@ -465,15 +540,37 @@ def main() -> int:
     )
 
     det_h, det_w, _ = det_infer.get_input_shape()
+    _, rec_out_infos = rec_infer.get_vstream_info()
+    rec_vocab_dim = int(rec_out_infos[0].shape[-1])
+    expected_dict_lens = {rec_vocab_dim - 1, rec_vocab_dim - 2}
 
     print(f"[INFO] Detector HEF: {det_hef}")
     print(f"[INFO] Recognizer HEF: {rec_hef}")
     print(f"[INFO] Input items: {len(input_items)}")
+    if rec_character_dict is not None:
+        dict_len = len(rec_character_dict)
+        print(f"[INFO] Recognition dictionary loaded: {rec_dictionary_path} ({dict_len} entries)")
+        if dict_len not in expected_dict_lens:
+            print("[WARN] Recognition dictionary size mismatch for current HEF.")
+            print(f"  Recognizer output classes: {rec_vocab_dim}")
+            print(f"  Expected dictionary entries (common CTC layouts): {sorted(expected_dict_lens)}")
+            print(f"  Loaded dictionary entries: {dict_len}")
+            print("  For paddle_ocr_v5_mobile_recognition, use ppocrv5_dict.txt (18383 entries) or equivalent NPZ dictionary.")
+    else:
+        print(f"[WARN] Recognition dictionary not found at {rec_dictionary_path}. Using legacy fallback decoder.")
     if args.a4_mode:
         print(f"[INFO] A4-mode enabled: PDF rendering at {args.pdf_dpi} DPI, tiling to detector native {det_h}×{det_w}")
 
     summary = []
     start_total = time.perf_counter()
+    postprocess_mode = "legacy" if args.legacy_postprocess else args.postprocess_mode
+
+    orchestrator = OCRPostProcessor(
+        overlap_ratio=float(args.orchestrator_overlap_ratio),
+        iou_threshold=float(args.orchestrator_iou_threshold),
+        line_center_threshold_ratio=float(args.line_center_threshold_ratio),
+        right_column_ratio=float(args.right_column_ratio),
+    )
 
     try:
         for item_name, original in input_items:
@@ -484,9 +581,24 @@ def main() -> int:
             render_mode = "a4-native" if args.a4_mode else "manual-scale"
 
             if use_tiling:
-                if args.a4_mode:
+                if postprocess_mode == "orchestrator":
+                    effective_tile_h = max(1, int(args.det_tile_height))
+                    effective_tile_w = page_w
+                    windows = generate_vertical_strips(
+                        image_h=page_h,
+                        image_w=page_w,
+                        tile_height=effective_tile_h,
+                        overlap_ratio=float(args.orchestrator_overlap_ratio),
+                    )
+                elif args.a4_mode:
                     effective_tile_h = int(args.det_tile_height)
                     effective_tile_w = int(args.det_tile_width)
+                    windows = generate_sliding_windows(
+                        image_h=page_h,
+                        image_w=page_w,
+                        tile_size=effective_tile_w,
+                        overlap_ratio=float(args.tile_overlap_ratio),
+                    )
                 else:
                     effective_tile_w = max(128, int(args.tile_size))
                     effective_tile_h = int(effective_tile_w * det_h / det_w)
@@ -498,36 +610,70 @@ def main() -> int:
                         max_tiles_per_page=int(args.max_tiles_per_page),
                     )
                     effective_tile_h = int(effective_tile_w * det_h / det_w)
-
-                windows = generate_sliding_windows(
-                    image_h=page_h,
-                    image_w=page_w,
-                    tile_size=effective_tile_w,
-                    overlap_ratio=float(args.tile_overlap_ratio),
-                )
+                    windows = generate_sliding_windows(
+                        image_h=page_h,
+                        image_w=page_w,
+                        tile_size=effective_tile_w,
+                        overlap_ratio=float(args.tile_overlap_ratio),
+                    )
             else:
                 effective_tile_w = page_w
                 effective_tile_h = page_h
                 windows = [(0, 0, page_w, page_h)]
 
-            all_entries: List[Dict] = []
-            for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
-                tile = original[y1:y2, x1:x2]
-                tile_entries = infer_tile_entries(
-                    det_infer=det_infer,
-                    rec_infer=rec_infer,
-                    tile_image=tile,
-                    tile_origin_x=x1,
-                    tile_origin_y=y1,
-                    det_w=det_w,
-                    det_h=det_h,
-                    tile_index=tile_idx,
-                    rec_batch_size=int(args.rec_batch_size),
-                    min_box_area=max(1, int(args.min_box_area)),
-                )
-                all_entries.extend(tile_entries)
+            if postprocess_mode == "orchestrator":
+                strip_detections: List[List[Dict]] = []
+                strip_y_offsets: List[int] = []
 
-            dedup_entries = nms_entries(all_entries, iou_threshold=float(args.nms_iou_threshold))
+                for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
+                    tile = original[y1:y2, x1:x2]
+                    tile_entries = infer_tile_entries(
+                        det_infer=det_infer,
+                        rec_infer=rec_infer,
+                        tile_image=tile,
+                        tile_origin_x=0,
+                        tile_origin_y=0,
+                        det_w=det_w,
+                        det_h=det_h,
+                        tile_index=tile_idx,
+                        rec_batch_size=int(args.rec_batch_size),
+                        min_box_area=max(1, int(args.min_box_area)),
+                        rec_character_dict=rec_character_dict,
+                        output_local_boxes=True,
+                    )
+                    strip_detections.append(tile_entries)
+                    strip_y_offsets.append(int(y1))
+
+                page_structure = orchestrator.process_tiles(
+                    strip_detections=strip_detections,
+                    tile_height=effective_tile_h,
+                    page_width=page_w,
+                    strip_y_offsets=strip_y_offsets,
+                )
+                dedup_entries = list(page_structure.get("global_detections", []))
+                page_structure["entries"] = dedup_entries
+            else:
+                all_entries: List[Dict] = []
+                for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
+                    tile = original[y1:y2, x1:x2]
+                    tile_entries = infer_tile_entries(
+                        det_infer=det_infer,
+                        rec_infer=rec_infer,
+                        tile_image=tile,
+                        tile_origin_x=x1,
+                        tile_origin_y=y1,
+                        det_w=det_w,
+                        det_h=det_h,
+                        tile_index=tile_idx,
+                        rec_batch_size=int(args.rec_batch_size),
+                        min_box_area=max(1, int(args.min_box_area)),
+                        rec_character_dict=rec_character_dict,
+                    )
+                    all_entries.extend(tile_entries)
+
+                dedup_entries = nms_entries(all_entries, iou_threshold=float(args.nms_iou_threshold))
+                page_structure = build_page_structure(dedup_entries, page_w=page_w, page_h=page_h)
+
             boxes = [entry["bbox"] for entry in dedup_entries]
             texts = [entry["text"] for entry in dedup_entries]
 
@@ -535,14 +681,18 @@ def main() -> int:
             out_path = output_dir / f"{item_name}_ocr.png"
             cv2.imwrite(str(out_path), annotated)
 
-            page_structure = build_page_structure(dedup_entries, page_w=page_w, page_h=page_h)
             structured_json, structured_md = write_structured_outputs(item_name, page_structure, output_dir)
 
             elapsed = time.perf_counter() - start_item
+            effective_overlap = (
+                float(args.orchestrator_overlap_ratio)
+                if postprocess_mode == "orchestrator"
+                else float(args.tile_overlap_ratio)
+            )
             print(
                 f"[TIME] {item_name}: {elapsed:.3f}s "
                 f"({len(boxes)} regions, {len(windows)} tiles, tile={effective_tile_w}×{effective_tile_h}, "
-                f"mode={render_mode}, overlap={args.tile_overlap_ratio:.2f})"
+                f"mode={render_mode}/{postprocess_mode}, overlap={effective_overlap:.2f})"
             )
 
             summary.append(
@@ -554,7 +704,11 @@ def main() -> int:
                     "tile_width": int(effective_tile_w),
                     "tile_height": int(effective_tile_h),
                     "render_mode": render_mode,
+                    "postprocess_mode": postprocess_mode,
                     "tile_overlap_ratio": float(args.tile_overlap_ratio),
+                    "effective_overlap_ratio": float(effective_overlap),
+                    "orchestrator_overlap_ratio": float(args.orchestrator_overlap_ratio),
+                    "orchestrator_iou_threshold": float(args.orchestrator_iou_threshold),
                     "rec_batch_size": int(args.rec_batch_size),
                     "min_box_area": int(args.min_box_area),
                     "output": str(out_path),

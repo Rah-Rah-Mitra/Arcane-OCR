@@ -4,3 +4,4 @@ models:
 runtime:
   use_corrector: true
   dictionary_path: ./public/samples/frequency_dictionary_en_82_765.txt
+  rec_dictionary_path: ./public/samples/ppocrv5_dict.txt
