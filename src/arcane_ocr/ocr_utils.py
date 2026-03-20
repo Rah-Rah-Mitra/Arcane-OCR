@@ -18,9 +18,54 @@ CHARACTERS = [
 ]
 
 
-def ocr_eval_postprocess(infer_results: np.ndarray | list) -> List[Tuple[str, float]]:
-    dict_character = list(CHARACTERS)
+def ocr_eval_postprocess(
+    infer_results: np.ndarray | list,
+    character_dict: List[str] | None = None,
+) -> List[Tuple[str, float]]:
+    return ocr_eval_postprocess_with_dict(infer_results, character_dict=character_dict)
+
+
+def load_ocr_character_dictionary(dict_path: str) -> List[str]:
+    if not os.path.exists(dict_path):
+        raise FileNotFoundError(f"Missing recognition dictionary file: {dict_path}")
+
+    if dict_path.lower().endswith(".npz"):
+        payload = np.load(dict_path)
+        if "dictionary" not in payload:
+            raise ValueError(f"NPZ dictionary file missing 'dictionary' key: {dict_path}")
+
+        chars: List[str] = []
+        for token in payload["dictionary"]:
+            if isinstance(token, bytes):
+                chars.append(token.decode("utf-8", errors="ignore"))
+            else:
+                chars.append(str(token))
+        chars = [c for c in chars if c]
+        if not chars:
+            raise ValueError(f"Recognition dictionary is empty: {dict_path}")
+        return chars
+
+    chars: List[str] = []
+    with open(dict_path, "r", encoding="utf-8") as f:
+        for line in f:
+            token = line.rstrip("\r\n")
+            if token:
+                chars.append(token)
+
+    if not chars:
+        raise ValueError(f"Recognition dictionary is empty: {dict_path}")
+    return chars
+
+
+def ocr_eval_postprocess_with_dict(
+    infer_results: np.ndarray | list,
+    character_dict: List[str] | None,
+) -> List[Tuple[str, float]]:
+    dict_character = list(character_dict) if character_dict else list(CHARACTERS)
+    # Compiled PP-OCRv5 recognizer HEFs expose one blank/control token offset.
     ignored_tokens = [0]
+    token_shift = 1 if character_dict else 0
+    vocab_size = len(dict_character)
 
     if isinstance(infer_results, list):
         infer_results = np.array(infer_results)
@@ -39,7 +84,12 @@ def ocr_eval_postprocess(infer_results: np.ndarray | list) -> List[Tuple[str, fl
         for ignored_token in ignored_tokens:
             selection &= text_index[batch_idx] != ignored_token
 
-        char_list = [dict_character[text_id] for text_id in text_index[batch_idx][selection]]
+        char_list = []
+        for text_id in text_index[batch_idx][selection]:
+            idx = int(text_id)
+            mapped_idx = idx - token_shift
+            if 0 <= mapped_idx < vocab_size:
+                char_list.append(dict_character[mapped_idx])
         conf_list = text_prob[batch_idx][selection] if text_prob is not None else [1] * len(selection)
         if len(conf_list) == 0:
             conf_list = [0]
@@ -146,7 +196,9 @@ def det_postprocess(
     model_height: int,
     model_width: int,
 ) -> Tuple[List[np.ndarray], List[List[int]]]:
-    heatmap = infer_results[:, :, 0]
+    heatmap = infer_results[:, :, 0].astype(np.float32)
+    if float(np.max(heatmap)) > 1.5:
+        heatmap = heatmap / 255.0
     return get_cropped_text_images(heatmap, orig_img, model_height, model_width)
 
 

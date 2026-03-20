@@ -18,6 +18,7 @@ from .ocr_utils import (
     OcrCorrector,
     default_preprocess,
     det_postprocess,
+    load_ocr_character_dictionary,
     ocr_eval_postprocess,
     resize_with_padding,
     visualize_ocr_annotations,
@@ -278,6 +279,7 @@ def infer_tile_entries(
     tile_index: int,
     rec_batch_size: int,
     min_box_area: int,
+    rec_character_dict: List[str] | None,
 ) -> List[Dict]:
     det_input = default_preprocess(tile_image, det_w, det_h)
     det_out = run_single_inference(det_infer, det_input)
@@ -309,7 +311,7 @@ def infer_tile_entries(
         batch_out = run_batch_inference(rec_infer, batch_inputs)
 
         for rec_out, (crop_idx, local_box) in zip(batch_out[:actual_count], batch_meta[:actual_count]):
-            text, conf = ocr_eval_postprocess(rec_out)[0]
+            text, conf = ocr_eval_postprocess(rec_out, character_dict=rec_character_dict)[0]
             text = text.strip()
             if not text:
                 continue
@@ -428,6 +430,7 @@ def main() -> int:
         use_corrector = False
 
     dictionary_path = Path(config.get("runtime", {}).get("dictionary_path", "./public/samples/frequency_dictionary_en_82_765.txt")).expanduser().resolve()
+    rec_dictionary_path = Path(config.get("runtime", {}).get("rec_dictionary_path", "./public/samples/ppocrv5_dict.txt")).expanduser().resolve()
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -447,6 +450,9 @@ def main() -> int:
     )
 
     ocr_corrector = OcrCorrector(str(dictionary_path)) if use_corrector else None
+    rec_character_dict: List[str] | None = None
+    if rec_dictionary_path.exists():
+        rec_character_dict = load_ocr_character_dictionary(str(rec_dictionary_path))
 
     shared_vdevice = create_shared_vdevice(group_id=args.group_id)
     det_infer = HailoInfer(
@@ -465,10 +471,24 @@ def main() -> int:
     )
 
     det_h, det_w, _ = det_infer.get_input_shape()
+    _, rec_out_infos = rec_infer.get_vstream_info()
+    rec_vocab_dim = int(rec_out_infos[0].shape[-1])
+    expected_dict_lens = {rec_vocab_dim - 1, rec_vocab_dim - 2}
 
     print(f"[INFO] Detector HEF: {det_hef}")
     print(f"[INFO] Recognizer HEF: {rec_hef}")
     print(f"[INFO] Input items: {len(input_items)}")
+    if rec_character_dict is not None:
+        dict_len = len(rec_character_dict)
+        print(f"[INFO] Recognition dictionary loaded: {rec_dictionary_path} ({dict_len} entries)")
+        if dict_len not in expected_dict_lens:
+            print("[WARN] Recognition dictionary size mismatch for current HEF.")
+            print(f"  Recognizer output classes: {rec_vocab_dim}")
+            print(f"  Expected dictionary entries (common CTC layouts): {sorted(expected_dict_lens)}")
+            print(f"  Loaded dictionary entries: {dict_len}")
+            print("  For paddle_ocr_v5_mobile_recognition, use ppocrv5_dict.txt (18383 entries) or equivalent NPZ dictionary.")
+    else:
+        print(f"[WARN] Recognition dictionary not found at {rec_dictionary_path}. Using legacy fallback decoder.")
     if args.a4_mode:
         print(f"[INFO] A4-mode enabled: PDF rendering at {args.pdf_dpi} DPI, tiling to detector native {det_h}×{det_w}")
 
@@ -524,6 +544,7 @@ def main() -> int:
                     tile_index=tile_idx,
                     rec_batch_size=int(args.rec_batch_size),
                     min_box_area=max(1, int(args.min_box_area)),
+                    rec_character_dict=rec_character_dict,
                 )
                 all_entries.extend(tile_entries)
 
