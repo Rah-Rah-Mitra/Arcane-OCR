@@ -6,3 +6,4 @@ symspellpy
 pypdfium2
 Pillow
 PyYAML
+degirum-tools

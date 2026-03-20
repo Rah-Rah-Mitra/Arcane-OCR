@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Tuple
 
@@ -12,6 +13,7 @@ import cv2
 import numpy as np
 import pypdfium2 as pdfium
 import yaml
+from degirum_tools import generate_tiles_fixed_size
 
 from .hailo_inference import HailoInfer, create_shared_vdevice
 from .ocr_utils import (
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--tile-overlap-ratio",
         type=float,
         default=0.12,
-        help="Tile overlap ratio in [0,1). Example: 0.12 means 12% overlap",
+        help="Tile overlap ratio in [0,1). Example: 0.12 means 12%% overlap",
     )
     parser.add_argument("--disable-tiling", action="store_true", help="Disable tiling and run on whole page")
     parser.add_argument("--nms-iou-threshold", type=float, default=0.5, help="IoU threshold for duplicate suppression")
@@ -64,6 +66,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rec-priority", type=int, default=1, help="Scheduler priority for recognizer model")
     parser.add_argument("--group-id", default="SHARED", help="Hailo vdevice group id")
     parser.add_argument("--max-pages", type=int, default=0, help="Limit PDF pages (0 means all pages)")
+    # --- Advanced tiling strategies ---
+    parser.add_argument(
+        "--edge-threshold",
+        type=float,
+        default=0.03,
+        help="Edge band as fraction of tile dimension for box fusion (0.03 = 3%%)",
+    )
+    parser.add_argument(
+        "--fusion-threshold",
+        type=float,
+        default=0.5,
+        help="1D IoU threshold for fusing split edge detections",
+    )
+    parser.add_argument("--disable-edge-fusion", action="store_true", help="Disable edge box fusion")
+    parser.add_argument("--enable-local-global", action="store_true", help="Enable local+global tiling strategy")
+    parser.add_argument(
+        "--large-object-threshold",
+        type=float,
+        default=0.005,
+        help="Area ratio threshold for local vs global object assignment",
+    )
+    parser.add_argument(
+        "--tile-workers",
+        type=int,
+        default=1,
+        help="Number of parallel tile inference threads (1=sequential, 2-3 for overlap)",
+    )
     return parser.parse_args()
 
 
@@ -125,6 +154,11 @@ def resolve_input_items(
     return items
 
 
+# ---------------------------------------------------------------------------
+# Inference helpers (unchanged)
+# ---------------------------------------------------------------------------
+
+
 def run_single_inference(hailo_infer: HailoInfer, image: np.ndarray) -> np.ndarray:
     holder: Dict[str, np.ndarray | Exception] = {}
 
@@ -168,12 +202,18 @@ def run_batch_inference(hailo_infer: HailoInfer, images: List[np.ndarray]) -> Li
     return holder["result"]  # type: ignore[return-value]
 
 
+# ---------------------------------------------------------------------------
+# Tiling strategies
+# ---------------------------------------------------------------------------
+
+
 def generate_sliding_windows(
     image_h: int,
     image_w: int,
     tile_size: int,
     overlap_ratio: float,
 ) -> List[Tuple[int, int, int, int]]:
+    """Legacy square-tile sliding window (kept as fallback)."""
     overlap_ratio = max(0.0, min(overlap_ratio, 0.95))
     stride = max(1, int(tile_size * (1.0 - overlap_ratio)))
 
@@ -197,6 +237,37 @@ def generate_sliding_windows(
             x2 = min(image_w, x + tile_size)
             y2 = min(image_h, y + tile_size)
             windows.append((x, y, x2, y2))
+    return windows
+
+
+def generate_aspect_ratio_windows(
+    image_h: int,
+    image_w: int,
+    tile_w: int,
+    tile_h: int,
+    overlap_percent: float,
+) -> List[Tuple[int, int, int, int]]:
+    """Generate tiling windows matching the detector's native aspect ratio.
+
+    Uses degirum_tools.generate_tiles_fixed_size() for proper 2D grid
+    generation with independent width/height and evenly-distributed overlap.
+    """
+    if image_w <= tile_w and image_h <= tile_h:
+        return [(0, 0, image_w, image_h)]
+
+    eff_tile_w = min(tile_w, image_w)
+    eff_tile_h = min(tile_h, image_h)
+
+    tiles_grid = generate_tiles_fixed_size(
+        tile_size=(eff_tile_w, eff_tile_h),
+        image_size=(image_w, image_h),
+        min_overlap_percent=(overlap_percent, overlap_percent),
+    )
+    windows: List[Tuple[int, int, int, int]] = []
+    for row_idx in range(tiles_grid.shape[0]):
+        for col_idx in range(tiles_grid.shape[1]):
+            x1, y1, x2, y2 = tiles_grid[row_idx, col_idx]
+            windows.append((int(x1), int(y1), int(x2), int(y2)))
     return windows
 
 
@@ -224,6 +295,11 @@ def adapt_tile_size_for_budget(
     return max_dim
 
 
+# ---------------------------------------------------------------------------
+# NMS (OpenCV-accelerated)
+# ---------------------------------------------------------------------------
+
+
 def box_iou_xywh(box_a: List[int], box_b: List[int]) -> float:
     ax1, ay1, aw, ah = box_a
     bx1, by1, bw, bh = box_b
@@ -248,23 +324,201 @@ def box_iou_xywh(box_a: List[int], box_b: List[int]) -> float:
 
 
 def nms_entries(entries: List[Dict], iou_threshold: float) -> List[Dict]:
+    """Suppress duplicate detections using OpenCV NMS.
+
+    Uses cv2.dnn.NMSBoxes for fast C++ NMS instead of O(n^2) Python loop.
+    Bboxes are in [x, y, w, h] format which cv2.dnn.NMSBoxes expects.
+    """
     if not entries:
         return []
 
-    sorted_entries = sorted(entries, key=lambda e: float(e.get("score", 0.0)), reverse=True)
-    kept: List[Dict] = []
+    bboxes = [entry["bbox"] for entry in entries]
+    scores = [float(entry.get("score", 0.0)) for entry in entries]
 
-    for candidate in sorted_entries:
-        candidate_box = candidate["bbox"]
-        suppress = False
-        for existing in kept:
-            if box_iou_xywh(candidate_box, existing["bbox"]) > iou_threshold:
-                suppress = True
-                break
-        if not suppress:
-            kept.append(candidate)
+    indices = cv2.dnn.NMSBoxes(bboxes, scores, score_threshold=0.0, nms_threshold=iou_threshold)
+    if len(indices) == 0:
+        return []
 
+    indices = np.array(indices).flatten()
+    kept = [entries[i] for i in indices]
     return sorted(kept, key=lambda e: (e["bbox"][1], e["bbox"][0]))
+
+
+# ---------------------------------------------------------------------------
+# Edge box fusion (from 017_advanced_tiling_strategies notebook)
+# ---------------------------------------------------------------------------
+
+
+def _compute_grid_dims(windows: List[Tuple[int, int, int, int]]) -> Tuple[int, int]:
+    """Infer (n_rows, n_cols) from a row-major list of tile windows."""
+    if not windows:
+        return (1, 1)
+    first_y = windows[0][1]
+    n_cols = 0
+    for w in windows:
+        if w[1] == first_y:
+            n_cols += 1
+        else:
+            break
+    n_cols = max(1, n_cols)
+    n_rows = max(1, len(windows) // n_cols)
+    return (n_rows, n_cols)
+
+
+def _max_1d_iou(box_a: List[float], box_b: List[float]) -> float:
+    """Compute max(iou_x, iou_y) for two boxes in [x1,y1,x2,y2] format.
+
+    Two text fragments split by a tile edge will have high 1D IoU in the
+    axis parallel to the split (e.g. high iou_y for a vertical tile edge
+    cutting a horizontal text line).
+    """
+    inter_x = max(0.0, min(box_a[2], box_b[2]) - max(box_a[0], box_b[0]))
+    inter_y = max(0.0, min(box_a[3], box_b[3]) - max(box_a[1], box_b[1]))
+
+    if min(inter_x, inter_y) == 0:
+        return 0.0
+
+    wa = box_a[2] - box_a[0]
+    wb = box_b[2] - box_b[0]
+    ha = box_a[3] - box_a[1]
+    hb = box_b[3] - box_b[1]
+
+    iou_x = inter_x / max(wa + wb - inter_x, 1e-6)
+    iou_y = inter_y / max(ha + hb - inter_y, 1e-6)
+
+    return max(iou_x, iou_y)
+
+
+def classify_edge_entries(
+    entries: List[Dict],
+    tile_windows: List[Tuple[int, int, int, int]],
+    edge_threshold: float = 0.03,
+    n_cols: int = 1,
+    n_rows: int = 1,
+) -> Tuple[List[Dict], List[Dict]]:
+    """Separate entries into central and edge detections.
+
+    Edge entries are those whose bounding box falls within the edge band
+    of an interior tile edge (edges that border another tile, not image
+    boundaries).
+    """
+    central: List[Dict] = []
+    edge: List[Dict] = []
+
+    for entry in entries:
+        tile_idx = entry.get("tile_index", 0)
+        if tile_idx < 0 or tile_idx >= len(tile_windows):
+            central.append(entry)
+            continue
+
+        tx1, ty1, tx2, ty2 = tile_windows[tile_idx]
+        tile_w = tx2 - tx1
+        tile_h = ty2 - ty1
+
+        bx, by, bw, bh = entry["bbox"]
+        gx1, gy1, gx2, gy2 = bx, by, bx + bw, by + bh
+
+        row = tile_idx // n_cols
+        col = tile_idx % n_cols
+        has_top = row > 0
+        has_bot = row < n_rows - 1
+        has_left = col > 0
+        has_right = col < n_cols - 1
+
+        margin_x = int(edge_threshold * tile_w)
+        margin_y = int(edge_threshold * tile_h)
+
+        is_edge = False
+        if has_top and gy1 < ty1 + margin_y:
+            is_edge = True
+        if has_bot and gy2 > ty2 - margin_y:
+            is_edge = True
+        if has_left and gx1 < tx1 + margin_x:
+            is_edge = True
+        if has_right and gx2 > tx2 - margin_x:
+            is_edge = True
+
+        if is_edge:
+            e = dict(entry)
+            e["_xyxy"] = [float(gx1), float(gy1), float(gx2), float(gy2)]
+            edge.append(e)
+        else:
+            central.append(entry)
+
+    return central, edge
+
+
+def fuse_edge_entries(
+    edge_entries: List[Dict],
+    fusion_threshold: float = 0.5,
+) -> List[Dict]:
+    """Fuse split text detections at tile edges using 1D IoU.
+
+    Implements the edge_box_fusion algorithm: for each pair of edge
+    detections, computes max(iou_x, iou_y) and merges if above threshold.
+    Picks the higher-confidence text for the merged result.
+    """
+    if not edge_entries:
+        return []
+
+    sorted_entries = sorted(edge_entries, key=lambda e: -e["score"])
+
+    # First pass: group by 1D IoU (max 2 per group)
+    groups: List[List[Dict]] = []
+    used = [False] * len(sorted_entries)
+
+    for i, entry_a in enumerate(sorted_entries):
+        if used[i]:
+            continue
+        group = [entry_a]
+        used[i] = True
+        for j in range(i + 1, len(sorted_entries)):
+            if used[j]:
+                continue
+            if len(group) >= 2:
+                break
+            iou_1d = _max_1d_iou(entry_a["_xyxy"], sorted_entries[j]["_xyxy"])
+            if iou_1d > fusion_threshold:
+                group.append(sorted_entries[j])
+                used[j] = True
+        groups.append(group)
+
+    # Merge each group
+    fused: List[Dict] = []
+    for group in groups:
+        if len(group) == 1:
+            e = group[0]
+            xyxy = e["_xyxy"]
+            fused.append({
+                "bbox": [int(xyxy[0]), int(xyxy[1]), int(xyxy[2] - xyxy[0]), int(xyxy[3] - xyxy[1])],
+                "text": e["text"],
+                "score": e["score"],
+                "tile_index": e["tile_index"],
+                "crop_index": e.get("crop_index", -1),
+            })
+        else:
+            a, b = group[0], group[1]
+            ax, bx = a["_xyxy"], b["_xyxy"]
+            mx1 = min(ax[0], bx[0])
+            my1 = min(ax[1], bx[1])
+            mx2 = max(ax[2], bx[2])
+            my2 = max(ax[3], bx[3])
+            text = a["text"] if a["score"] >= b["score"] else b["text"]
+            score = (a["score"] + b["score"]) / 2.0
+            fused.append({
+                "bbox": [int(mx1), int(my1), int(mx2 - mx1), int(my2 - my1)],
+                "text": text,
+                "score": score,
+                "tile_index": a["tile_index"],
+                "crop_index": a.get("crop_index", -1),
+            })
+
+    return fused
+
+
+# ---------------------------------------------------------------------------
+# Per-tile inference (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def infer_tile_entries(
@@ -327,6 +581,110 @@ def infer_tile_entries(
             )
 
     return tile_entries
+
+
+# ---------------------------------------------------------------------------
+# Local+Global strategy (from 017_advanced_tiling_strategies notebook)
+# ---------------------------------------------------------------------------
+
+
+def run_local_global_inference(
+    det_infer: HailoInfer,
+    rec_infer: HailoInfer,
+    original: np.ndarray,
+    windows: List[Tuple[int, int, int, int]],
+    det_w: int,
+    det_h: int,
+    rec_batch_size: int,
+    min_box_area: int,
+    large_object_threshold: float = 0.005,
+) -> List[Dict]:
+    """Run local (tile) + global (full-image) inference and merge by object size.
+
+    Large detections (area >= threshold * page_area) from tiles are discarded
+    in favor of the global inference, which sees them without fragmentation.
+    Small detections from the global inference are discarded in favor of tile
+    results, which have higher resolution.
+    """
+    page_h, page_w = original.shape[:2]
+    page_area = page_w * page_h
+
+    local_entries: List[Dict] = []
+    for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
+        tile = original[y1:y2, x1:x2]
+        tile_entries = infer_tile_entries(
+            det_infer, rec_infer, tile, x1, y1,
+            det_w, det_h, tile_idx, rec_batch_size, min_box_area,
+        )
+        local_entries.extend(tile_entries)
+
+    area_threshold = large_object_threshold * page_area
+    local_filtered = [
+        e for e in local_entries
+        if e["bbox"][2] * e["bbox"][3] < area_threshold
+    ]
+
+    global_entries = infer_tile_entries(
+        det_infer, rec_infer, original, 0, 0,
+        det_w, det_h, tile_index=-1,
+        rec_batch_size=rec_batch_size, min_box_area=min_box_area,
+    )
+
+    global_min_threshold = large_object_threshold * 0.5
+    global_filtered = [
+        e for e in global_entries
+        if e["bbox"][2] * e["bbox"][3] >= global_min_threshold * page_area
+    ]
+
+    return local_filtered + global_filtered
+
+
+# ---------------------------------------------------------------------------
+# Multi-threaded tile inference (from 006_multi_threading notebook)
+# ---------------------------------------------------------------------------
+
+
+def infer_tiles_parallel(
+    det_infer: HailoInfer,
+    rec_infer: HailoInfer,
+    original: np.ndarray,
+    windows: List[Tuple[int, int, int, int]],
+    det_w: int,
+    det_h: int,
+    rec_batch_size: int,
+    min_box_area: int,
+    max_workers: int = 2,
+) -> List[Dict]:
+    """Process tiles in parallel using a thread pool.
+
+    Overlaps Python preprocessing with Hailo inference. Keep max_workers
+    at 2-3 since the HailoInfer's wait_for_async_ready gate serializes
+    actual accelerator access.
+    """
+    all_entries: List[Dict] = []
+
+    def _process_tile(tile_idx: int, x1: int, y1: int, x2: int, y2: int) -> List[Dict]:
+        tile = original[y1:y2, x1:x2]
+        return infer_tile_entries(
+            det_infer, rec_infer, tile, x1, y1,
+            det_w, det_h, tile_idx, rec_batch_size, min_box_area,
+        )
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_tile, idx, x1, y1, x2, y2): idx
+            for idx, (x1, y1, x2, y2) in enumerate(windows)
+        }
+        for future in as_completed(futures):
+            tile_entries = future.result()
+            all_entries.extend(tile_entries)
+
+    return all_entries
+
+
+# ---------------------------------------------------------------------------
+# Structured output and visualization (unchanged)
+# ---------------------------------------------------------------------------
 
 
 def build_page_structure(entries: List[Dict], page_w: int, page_h: int) -> Dict:
@@ -413,6 +771,11 @@ def write_structured_outputs(page_name: str, page_structure: Dict, output_dir: P
     return json_path, md_path
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     args = parse_args()
     config = load_config(Path(args.config))
@@ -472,6 +835,10 @@ def main() -> int:
     if args.a4_mode:
         print(f"[INFO] A4-mode enabled: PDF rendering at {args.pdf_dpi} DPI, tiling to detector native {det_h}×{det_w}")
 
+    use_edge_fusion = not args.disable_edge_fusion
+    use_local_global = args.enable_local_global
+    tile_workers = max(1, int(args.tile_workers))
+
     summary = []
     start_total = time.perf_counter()
 
@@ -499,34 +866,67 @@ def main() -> int:
                     )
                     effective_tile_h = int(effective_tile_w * det_h / det_w)
 
-                windows = generate_sliding_windows(
+                overlap_pct = float(args.tile_overlap_ratio) * 100.0
+                windows = generate_aspect_ratio_windows(
                     image_h=page_h,
                     image_w=page_w,
-                    tile_size=effective_tile_w,
-                    overlap_ratio=float(args.tile_overlap_ratio),
+                    tile_w=effective_tile_w,
+                    tile_h=effective_tile_h,
+                    overlap_percent=overlap_pct,
                 )
             else:
                 effective_tile_w = page_w
                 effective_tile_h = page_h
                 windows = [(0, 0, page_w, page_h)]
 
-            all_entries: List[Dict] = []
-            for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
-                tile = original[y1:y2, x1:x2]
-                tile_entries = infer_tile_entries(
-                    det_infer=det_infer,
-                    rec_infer=rec_infer,
-                    tile_image=tile,
-                    tile_origin_x=x1,
-                    tile_origin_y=y1,
-                    det_w=det_w,
-                    det_h=det_h,
-                    tile_index=tile_idx,
-                    rec_batch_size=int(args.rec_batch_size),
-                    min_box_area=max(1, int(args.min_box_area)),
+            # --- Tile inference ---
+            if use_local_global and use_tiling:
+                all_entries = run_local_global_inference(
+                    det_infer, rec_infer, original, windows,
+                    det_w, det_h,
+                    int(args.rec_batch_size), max(1, int(args.min_box_area)),
+                    large_object_threshold=float(args.large_object_threshold),
                 )
-                all_entries.extend(tile_entries)
+            elif tile_workers > 1 and use_tiling:
+                all_entries = infer_tiles_parallel(
+                    det_infer, rec_infer, original, windows,
+                    det_w, det_h,
+                    int(args.rec_batch_size), max(1, int(args.min_box_area)),
+                    max_workers=tile_workers,
+                )
+            else:
+                all_entries: List[Dict] = []
+                for tile_idx, (x1, y1, x2, y2) in enumerate(windows):
+                    tile = original[y1:y2, x1:x2]
+                    tile_entries = infer_tile_entries(
+                        det_infer=det_infer,
+                        rec_infer=rec_infer,
+                        tile_image=tile,
+                        tile_origin_x=x1,
+                        tile_origin_y=y1,
+                        det_w=det_w,
+                        det_h=det_h,
+                        tile_index=tile_idx,
+                        rec_batch_size=int(args.rec_batch_size),
+                        min_box_area=max(1, int(args.min_box_area)),
+                    )
+                    all_entries.extend(tile_entries)
 
+            # --- Edge box fusion ---
+            if use_edge_fusion and use_tiling and len(windows) > 1:
+                n_rows, n_cols = _compute_grid_dims(windows)
+                central_entries, edge_entries = classify_edge_entries(
+                    all_entries, windows,
+                    edge_threshold=float(args.edge_threshold),
+                    n_cols=n_cols, n_rows=n_rows,
+                )
+                fused_edge = fuse_edge_entries(
+                    edge_entries,
+                    fusion_threshold=float(args.fusion_threshold),
+                )
+                all_entries = central_entries + fused_edge
+
+            # --- NMS ---
             dedup_entries = nms_entries(all_entries, iou_threshold=float(args.nms_iou_threshold))
             boxes = [entry["bbox"] for entry in dedup_entries]
             texts = [entry["text"] for entry in dedup_entries]

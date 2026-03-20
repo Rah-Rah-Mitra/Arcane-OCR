@@ -1,6 +1,6 @@
-# Full Pipeline Setup (OCR-Only)
+# Full Pipeline Setup
 
-This document describes the complete setup flow for this OCR-only project.
+Complete setup flow for Arcane OCR on Raspberry Pi + Hailo-8L.
 
 ## Required Local Packages
 
@@ -14,27 +14,33 @@ Expected in `setup-files/`:
 
 ## Setup Sequence
 
-1. Recreate project venv:
+### 1. Create virtual environment
 
 ```bash
 ./scripts/setup_venv.sh
 source .venv/bin/activate
 ```
 
-2. Install runtime components:
+### 2. Install Hailo runtime
 
 ```bash
 source .venv/bin/activate
 ./scripts/install_hailo_runtime.sh
 ```
 
-3. Download OCR models:
+### 3. Download OCR models
 
 ```bash
 ./scripts/download_models.sh
 ```
 
-4. Validate package state:
+### 4. Install Python dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+### 5. Validate installation
 
 ```bash
 ./scripts/check_installed_packages.sh
@@ -52,66 +58,70 @@ python -m pip show hailort hailo-tappas-core-python-binding
   --output-dir ./output/image_run
 ```
 
-### PDF OCR
+### PDF OCR (A4-Optimized, recommended)
 
 ```bash
 ./scripts/run_ocr.sh \
   --input ./public/samples/contents_page_sample.pdf \
-  --output-dir ./output/pdf_run
-```
-
-### High-Precision PDF OCR (Dense Pages)
-
-```bash
-./scripts/run_ocr.sh \
-  --input ./public/samples/contents_page_sample.pdf \
-  --output-dir ./output/pdf_tiled_run \
-  --tile-size 1024 \
-  --tile-overlap-ratio 0.12
-```
-
-This mode uses overlapping sliding windows, maps tile detections back to page coordinates, and applies NMS to remove duplicates from overlap regions.
-
-### A4-Optimized High-Throughput OCR (Recommended for PDFs)
-
-A4-aware rendering with detector-native tiling eliminates resolution loss:
-
-```bash
-./scripts/run_ocr.sh \
-  --input ./public/samples/contents_page_sample.pdf \
-  --output-dir ./output/pdf_a4native_run \
+  --output-dir ./output/pdf_a4_run \
   --a4-mode \
   --pdf-dpi 200 \
   --tile-overlap-ratio 0.12 \
   --rec-batch-size 8
 ```
 
-This mode applies three key optimizations:
+This uses aspect-ratio-aware tiling at detector-native 544x960 dimensions with edge box fusion enabled by default.
 
-- **Standard A4 DPI rendering**: PDF pages rendered at 200 DPI (standard for document OCR on A4 size).
-- **Detector native tiling**: 544×960 tiles match detector input dimensions exactly, eliminating shrinking loss.
-- **Batched recognizer inference**: Groups text crops for higher throughput.
+### PDF OCR with edge fusion disabled (comparison)
 
-Performance:
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_no_fusion \
+  --a4-mode \
+  --disable-edge-fusion
+```
 
-- 7-page PDF: 17.7 seconds total (874 regions)
-- 6 tiles per page
-- 2.6× faster than max-accuracy tiling mode
-- Quality parity or better (no downsampling artifacts)
+### PDF OCR with local+global strategy
 
-DPI selection:
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_localglobal \
+  --a4-mode \
+  --enable-local-global \
+  --large-object-threshold 0.005
+```
 
-- `--pdf-dpi 150`: Faster, lower detail (1240×1754 A4 pixels)
-- `--pdf-dpi 200`: Balanced (1653×2339 A4 pixels) - **recommended**
-- `--pdf-dpi 250`: Higher detail (2062×2924 A4 pixels)
-- `--pdf-dpi 300`: Maximum detail (2480×3508 A4 pixels)
+### PDF OCR with parallel tile inference
+
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_parallel \
+  --a4-mode \
+  --tile-workers 2
+```
+
+### High-Precision PDF OCR (dense pages)
+
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/samples/contents_page_sample.pdf \
+  --output-dir ./output/pdf_dense \
+  --a4-mode \
+  --pdf-dpi 300 \
+  --tile-overlap-ratio 0.15 \
+  --rec-batch-size 4 \
+  --nms-iou-threshold 0.45
+```
 
 ### Balanced High-Throughput OCR
 
 ```bash
 ./scripts/run_ocr.sh \
   --input ./public/samples/contents_page_sample.pdf \
-  --output-dir ./output/pdf_balanced_run \
+  --output-dir ./output/pdf_balanced \
   --pdf-scale 2.5 \
   --tile-size 1024 \
   --tile-overlap-ratio 0.12 \
@@ -119,31 +129,67 @@ DPI selection:
   --rec-batch-size 8
 ```
 
-This mode applies two key optimizations:
+### Process without tiling (single-pass)
 
-- Adaptive tile budgeting: avoids unnecessary tile count on high-resolution pages.
-- Batched recognizer inference: groups text crops into larger inference calls to reduce per-call overhead.
-
-Useful tuning flags:
-
-- `--max-tiles-per-page 0`: disable adaptation (fixed tile size).
-- `--min-box-area`: skip tiny detections that usually become OCR noise.
-- `--det-priority` / `--rec-priority`: scheduler priority between detection and recognition.
+```bash
+./scripts/run_ocr.sh \
+  --input ./public/images/ocr_sample_image.png \
+  --output-dir ./output/no_tile \
+  --disable-tiling
+```
 
 ## Output Artifacts
 
-For each run:
+Each run generates:
 
-- Annotated OCR output images in output directory
-- `timing_report.json` with per-input timing
-- `<page>_structured.json` with line-level hierarchy and global boxes
-- `<page>_structured.md` with markdown hierarchy output
+- `<page>_ocr.png` — annotated image with detected regions and recognized text
+- `<page>_structured.json` — structured data with bounding boxes, confidence, and text
+- `<page>_structured.md` — markdown hierarchy preserving indentation
+- `timing_report.json` — per-page timing, tile count, region count, and settings used
+
+## Configuration
+
+Default settings in `config/ocr_config.yaml`:
+
+```yaml
+models:
+  det_hef: ./models/hailo8l/ocr_det.hef
+  rec_hef: ./models/hailo8l/ocr.hef
+runtime:
+  use_corrector: true
+  dictionary_path: ./public/samples/frequency_dictionary_en_82_765.txt
+```
+
+All config values can be overridden via CLI flags.
 
 ## Troubleshooting
 
-- If `libhailort.so` errors appear:
-  - re-run `./scripts/install_hailo_runtime.sh`
-  - verify `ldconfig -p | grep libhailort`
-- If HEF compatibility fails:
-  - ensure HEFs come from `models/hailo8l/`
-  - avoid mixing HAILO8 HEFs with HAILO8L device
+### `libhailort.so` errors
+
+Re-run `./scripts/install_hailo_runtime.sh` and verify:
+
+```bash
+ldconfig -p | grep libhailort
+```
+
+### HEF compatibility failures
+
+Ensure HEFs are from `models/hailo8l/` (compiled for HAILO8L, not HAILO8).
+
+### `ModuleNotFoundError: degirum_tools`
+
+Install with: `pip install degirum-tools`
+
+### Text duplication in output
+
+This is handled by edge box fusion (enabled by default). If you still see duplicates:
+
+- Increase `--edge-threshold` to 0.05
+- Decrease `--fusion-threshold` to 0.3
+
+### Slow performance
+
+- Use `--a4-mode` (avoids unnecessary resolution)
+- Increase `--rec-batch-size` to 12
+- Try `--tile-workers 2`
+- Set `--max-tiles-per-page` to limit tile count
